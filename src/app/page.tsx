@@ -4,22 +4,50 @@ import { useRouter } from "next/navigation";
 import { useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 import { useLocalUser } from "@/lib/user";
+import { isDemo, makeSlug } from "@/lib/demo";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { DemoBanner } from "@/components/demo-banner";
 
 export default function Home() {
-  const router = useRouter();
+  return isDemo ? (
+    <>
+      <DemoBanner />
+      <HomeView createRoom={async () => makeSlug()} />
+    </>
+  ) : (
+    <HomeLive />
+  );
+}
+
+function HomeLive() {
   const [user] = useLocalUser();
-  const createRoom = useMutation(api.rooms.create);
+  const create = useMutation(api.rooms.create);
+  return (
+    <HomeView
+      ready={!!user}
+      createRoom={(name) => create({ name, hostId: user!.id })}
+    />
+  );
+}
+
+function HomeView({
+  createRoom,
+  ready = true,
+}: {
+  createRoom: (name: string) => Promise<string>;
+  ready?: boolean;
+}) {
+  const router = useRouter();
   const [name, setName] = useState("");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
 
   async function onCreate() {
-    if (!user) return;
+    if (!ready) return;
     setBusy(true);
     try {
-      const slug = await createRoom({ name, hostId: user.id });
+      const slug = await createRoom(name);
       router.push(`/r/${slug}`);
     } finally {
       setBusy(false);
@@ -49,7 +77,7 @@ export default function Home() {
             onChange={(e) => setName(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && onCreate()}
           />
-          <Button className="w-full" onClick={onCreate} disabled={!user || busy}>
+          <Button className="w-full" onClick={onCreate} disabled={!ready || busy}>
             {busy ? "creating…" : "create room"}
           </Button>
         </section>

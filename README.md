@@ -17,11 +17,25 @@ Next.js 16 (App Router, Turbopack) · React 19 · Convex · Tailwind v4 · shadc
 
 ```bash
 pnpm install            # re-link native binaries for macOS
-npx convex dev          # creates the Convex project, writes .env.local, regenerates convex/_generated
-pnpm dev                # http://localhost:3000
+pnpm dev                # http://localhost:3000 — runs in demo mode
 ```
 
-Open two browser windows (or a phone) on the same room link to see sync + independent volume.
+### Demo mode (no backend)
+
+With no `NEXT_PUBLIC_CONVEX_URL` set, the app runs entirely in the browser: every page
+works, any room code opens a seeded room, and the queue / requests / chat / playback all
+run off local state (`src/lib/demo.ts`). A banner marks it, the toggle in that banner
+flips between the host and guest view, and nothing is saved — a reload resets the room.
+
+### With Convex
+
+```bash
+npx convex dev          # creates the Convex project, writes .env.local, regenerates convex/_generated
+pnpm dev
+```
+
+`.env.local` with a `NEXT_PUBLIC_CONVEX_URL` is what switches demo mode off. Open two
+browser windows (or a phone) on the same room link to see sync + independent volume.
 
 ## How sync works
 
@@ -36,7 +50,7 @@ Play/pause/seek by the host update `startedAt`/`pausedAt`, which Convex pushes t
 convex/          schema + rooms / queue / requests / presence / messages / youtube (oEmbed resolver)
 src/app/         landing page, /r/[slug] room
 src/components/  youtube-player.tsx (sync wrapper), ui/* (shadcn-style primitives)
-src/lib/         local-store (useSyncExternalStore over localStorage), user, volume
+src/lib/         local-store (useSyncExternalStore over localStorage), user, volume, demo (no-backend store)
 ```
 
 `components.json` is set up so `pnpm dlx shadcn@latest add <component>` works.
