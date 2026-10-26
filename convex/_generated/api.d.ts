@@ -8,10 +8,13 @@
  * @module
  */
 
+import type * as crons from "../crons.js";
+import type * as limits from "../limits.js";
 import type * as messages from "../messages.js";
 import type * as presence from "../presence.js";
 import type * as queue from "../queue.js";
 import type * as requests from "../requests.js";
+import type * as retention from "../retention.js";
 import type * as rooms from "../rooms.js";
 import type * as spotify from "../spotify.js";
 import type * as trackId from "../trackId.js";
@@ -25,10 +28,13 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  crons: typeof crons;
+  limits: typeof limits;
   messages: typeof messages;
   presence: typeof presence;
   queue: typeof queue;
   requests: typeof requests;
+  retention: typeof retention;
   rooms: typeof rooms;
   spotify: typeof spotify;
   trackId: typeof trackId;
@@ -62,4 +68,6 @@ export declare const internal: FilterApi<
   FunctionReference<any, "internal">
 >;
 
-export declare const components: {};
+export declare const components: {
+  rateLimiter: import("@convex-dev/rate-limiter/_generated/component.js").ComponentApi<"rateLimiter">;
+};

@@ -2,7 +2,8 @@ import { v } from "convex/values";
 import { mutation, query, type MutationCtx } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
 import { trackFields, type Track } from "./schema";
-import { advance, holdsHostToken, requireHost } from "./rooms";
+import { advance, holdsHostToken, requireHost, touchRoom } from "./rooms";
+import { limitAddTrack } from "./limits";
 import { cleanDisplayName, cleanTrack } from "./validate";
 
 async function nextPosition(ctx: MutationCtx, roomId: Id<"rooms">) {
@@ -58,6 +59,8 @@ export const add = mutation({
   handler: async (ctx, { roomId, userId, userName, track, hostToken }) => {
     const room = await ctx.db.get(roomId);
     if (!room) throw new Error("Room not found");
+    await limitAddTrack(ctx, roomId);
+    await touchRoom(ctx, room);
     const clean = cleanTrack(track);
     const by = { id: userId, name: cleanDisplayName(userName) };
     if (holdsHostToken(room, hostToken) || room.mode === "open") {

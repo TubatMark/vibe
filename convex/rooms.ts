@@ -2,6 +2,7 @@ import { v } from "convex/values";
 import { mutation, query, type MutationCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
 import { cleanRoomName } from "./validate";
+import { limitCreateRoom } from "./limits";
 
 const ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 /**
@@ -17,6 +18,14 @@ const CODE_LENGTH = 10;
 const MIN_HOST_TOKEN = 32;
 /** No real track ends within a second of starting; see `ended`. */
 const MIN_PLAY_MS = 5_000;
+/**
+ * How stale `lastActiveAt` may get before a sign of life rewrites it. Idle
+ * rooms are pruned, so it has to be refreshed — but every listener is a source
+ * of activity, and rewriting the room row on each one would be the busiest
+ * write in the app for no benefit. Minutes of slack cost nothing against a
+ * month-long idle window.
+ */
+const ACTIVITY_INTERVAL_MS = 5 * 60_000;
 
 function makeSlug(len = CODE_LENGTH) {
   let s = "";
@@ -75,10 +84,18 @@ export async function advance(ctx: MutationCtx, room: Doc<"rooms">) {
   });
 }
 
+/** Any sign of life in a room, written at most once per interval. */
+export async function touchRoom(ctx: MutationCtx, room: Doc<"rooms">) {
+  const now = Date.now();
+  if (now - room.lastActiveAt < ACTIVITY_INTERVAL_MS) return;
+  await ctx.db.patch(room._id, { lastActiveAt: now });
+}
+
 export const create = mutation({
   args: { name: v.string(), hostId: v.string(), hostToken: v.string() },
   handler: async (ctx, { name, hostId, hostToken }) => {
     if (hostToken.length < MIN_HOST_TOKEN) throw new Error("Host token is too short");
+    await limitCreateRoom(ctx, hostId);
     let slug = makeSlug();
     while (
       await ctx.db

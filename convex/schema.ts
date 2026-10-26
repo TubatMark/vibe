@@ -41,7 +41,10 @@ export default defineSchema({
     startedAt: v.number(),
     pausedAt: v.number(),
     lastActiveAt: v.number(),
-  }).index("by_slug", ["slug"]),
+  })
+    .index("by_slug", ["slug"])
+    // Scanned by the retention cron looking for rooms nobody came back to.
+    .index("by_last_active", ["lastActiveAt"]),
 
   queue: defineTable({
     roomId: v.id("rooms"),
@@ -70,7 +73,9 @@ export default defineSchema({
     lastSeen: v.number(),
   })
     .index("by_room", ["roomId"])
-    .index("by_room_user", ["roomId", "userId"]),
+    .index("by_room_user", ["roomId", "userId"])
+    // Lets the cron sweep stale rows across all rooms at once.
+    .index("by_last_seen", ["lastSeen"]),
 
   messages: defineTable({
     roomId: v.id("rooms"),
