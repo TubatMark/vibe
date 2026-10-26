@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { cleanDisplayName } from "./validate";
 
 const TTL_MS = 30_000;
 
@@ -7,14 +8,15 @@ export const heartbeat = mutation({
   args: { roomId: v.id("rooms"), userId: v.string(), name: v.string() },
   handler: async (ctx, { roomId, userId, name }) => {
     const now = Date.now();
+    const display = cleanDisplayName(name);
     const existing = await ctx.db
       .query("presence")
       .withIndex("by_room_user", (q) => q.eq("roomId", roomId).eq("userId", userId))
       .unique();
     if (existing) {
-      await ctx.db.patch(existing._id, { lastSeen: now, name });
+      await ctx.db.patch(existing._id, { lastSeen: now, name: display });
     } else {
-      await ctx.db.insert("presence", { roomId, userId, name, lastSeen: now });
+      await ctx.db.insert("presence", { roomId, userId, name: display, lastSeen: now });
     }
     // Opportunistic cleanup of stale rows.
     const stale = await ctx.db

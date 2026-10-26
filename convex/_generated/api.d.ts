@@ -13,6 +13,9 @@ import type * as presence from "../presence.js";
 import type * as queue from "../queue.js";
 import type * as requests from "../requests.js";
 import type * as rooms from "../rooms.js";
+import type * as spotify from "../spotify.js";
+import type * as trackId from "../trackId.js";
+import type * as validate from "../validate.js";
 import type * as youtube from "../youtube.js";
 
 import type {
@@ -27,6 +30,9 @@ declare const fullApi: ApiFromModules<{
   queue: typeof queue;
   requests: typeof requests;
   rooms: typeof rooms;
+  spotify: typeof spotify;
+  trackId: typeof trackId;
+  validate: typeof validate;
   youtube: typeof youtube;
 }>;
 

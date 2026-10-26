@@ -2,6 +2,7 @@
 import { useMemo, useState } from "react";
 import { nanoid } from "nanoid";
 import type { LocalUser } from "./user";
+import { detectSource, extractSpotifyTrackId, extractYouTubeId, type Source } from "./track-source";
 
 /**
  * Local, in-memory stand-in for the Convex backend so every page can be clicked
@@ -15,6 +16,7 @@ export type Track = {
   title: string;
   author: string;
   thumbnail: string;
+  source?: Source;
 };
 
 export type DemoRoom = {
@@ -45,6 +47,24 @@ type State = {
 
 const DEMO_HOST = "demo-host";
 const ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+const demoRoomKey = (slug: string) => `vibe:demo-room:${slug}`;
+
+/** Keep the room name for this tab while its demo room is in memory. */
+export function rememberDemoRoom(slug: string, name: string) {
+  try {
+    sessionStorage.setItem(demoRoomKey(slug), name.trim().slice(0, 80) || "After hours");
+  } catch {
+    // Demo mode remains usable when browser storage is unavailable.
+  }
+}
+
+function demoRoomName(slug: string) {
+  try {
+    return sessionStorage.getItem(demoRoomKey(slug)) || "After hours";
+  } catch {
+    return "After hours";
+  }
+}
 
 /** Room code in the same shape the server generates. */
 export function makeSlug(len = 6) {
@@ -58,6 +78,7 @@ const track = (videoId: string, title: string, author: string): Track => ({
   title,
   author,
   thumbnail: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+  source: "youtube",
 });
 
 function seed(slug: string, user: LocalUser): State {
@@ -66,22 +87,22 @@ function seed(slug: string, user: LocalUser): State {
     room: {
       _id: "demo-room",
       slug,
-      name: "friday night queue",
+      name: demoRoomName(slug),
       hostId: user.id,
       mode: "approval",
-      current: track("ktvTqknDobU", "Midnight Pretenders", "Tomoko Aran"),
+      current: track("lTRiuFIWV54", "1 A.M Study Session", "Lofi Girl"),
       isPlaying: false,
       startedAt: now,
       pausedAt: 32_000,
       serverNow: now,
     },
     queue: [
-      { _id: "q1", addedBy: "u2", addedByName: "neon fox", ...track("dQw4w9WgXcQ", "Plastic Love", "Mariya Takeuchi") },
-      { _id: "q2", addedBy: user.id, addedByName: user.name, ...track("lTRiuFIWV54", "Flashlight", "Bôa") },
-      { _id: "q3", addedBy: "u3", addedByName: "velvet owl", ...track("jfKfPfyJRdk", "Nights Over Egypt", "The Jones Girls") },
+      { _id: "q1", addedBy: "u2", addedByName: "neon fox", ...track("dQw4w9WgXcQ", "Never Gonna Give You Up", "Rick Astley") },
+      { _id: "q2", addedBy: user.id, addedByName: user.name, ...track("ktvTqknDobU", "Radioactive", "Imagine Dragons") },
+      { _id: "q3", addedBy: "u3", addedByName: "velvet owl", ...track("jfKfPfyJRdk", "lofi hip hop radio · beats to relax/study to", "Lofi Girl") },
     ],
     requests: [
-      { _id: "r1", requestedBy: "u4", requestedByName: "dusty moth", ...track("hHW1oY26kxQ", "Fantasy", "Mariah Carey") },
+      { _id: "r1", requestedBy: "u4", requestedByName: "dusty moth", ...track("hHW1oY26kxQ", "lofi hip hop radio · beats to relax/study to", "Lofi Girl") },
     ],
     listeners: [
       { _id: "p1", userId: user.id, name: user.name },
@@ -112,7 +133,13 @@ function advance(s: State): State {
     queue: rest,
     room: {
       ...s.room,
-      current: { videoId: next.videoId, title: next.title, author: next.author, thumbnail: next.thumbnail },
+      current: {
+        videoId: next.videoId,
+        title: next.title,
+        author: next.author,
+        thumbnail: next.thumbnail,
+        source: next.source,
+      },
       isPlaying: true,
       startedAt: now,
       pausedAt: 0,
@@ -121,27 +148,15 @@ function advance(s: State): State {
   };
 }
 
-export function extractVideoId(input: string): string | null {
-  const s = input.trim();
-  if (/^[\w-]{11}$/.test(s)) return s;
-  try {
-    const u = new URL(s);
-    if (u.hostname === "youtu.be") return u.pathname.slice(1, 12) || null;
-    if (u.hostname.endsWith("youtube.com")) {
-      if (u.pathname === "/watch") return u.searchParams.get("v");
-      const m = u.pathname.match(/^\/(?:shorts|embed|live)\/([\w-]{11})/);
-      if (m) return m[1];
-    }
-  } catch {
-    /* not a URL */
-  }
-  return null;
-}
-
 /** Same oEmbed lookup the Convex action does, run straight from the browser. */
 async function resolveTrack(input: string): Promise<Track> {
-  const videoId = extractVideoId(input);
-  if (!videoId) throw new Error("That doesn't look like a YouTube link or ID");
+  const source = detectSource(input);
+  if (!source) throw new Error("paste a YouTube or Spotify track link");
+  return source === "spotify" ? resolveSpotify(input) : resolveYouTube(input);
+}
+
+async function resolveYouTube(input: string): Promise<Track> {
+  const videoId = extractYouTubeId(input)!;
   const fallback = track(videoId, "untitled track", "unknown");
   try {
     const res = await fetch(
@@ -150,6 +165,38 @@ async function resolveTrack(input: string): Promise<Track> {
     if (!res.ok) return fallback;
     const data = (await res.json()) as { title: string; author_name: string };
     return track(videoId, data.title, data.author_name);
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Demo mode has no server, so Spotify metadata comes from the public oEmbed
+ * endpoint. It gives a title and artwork but no artist, which is enough to see
+ * the queue; the real app resolves through convex/spotify.ts.
+ */
+async function resolveSpotify(input: string): Promise<Track> {
+  const id = extractSpotifyTrackId(input)!;
+  const fallback: Track = {
+    videoId: id,
+    title: "spotify track",
+    author: "spotify",
+    thumbnail: "",
+    source: "spotify",
+  };
+  try {
+    const res = await fetch(
+      `https://open.spotify.com/oembed?url=https://open.spotify.com/track/${id}`,
+    );
+    if (!res.ok) return fallback;
+    const data = (await res.json()) as { title: string; thumbnail_url: string };
+    return {
+      videoId: id,
+      title: data.title,
+      author: "spotify",
+      thumbnail: data.thumbnail_url,
+      source: "spotify",
+    };
   } catch {
     return fallback;
   }
@@ -178,11 +225,9 @@ export function useDemoRoom(slug: string, user: LocalUser) {
         setState((s) => ({ ...s, room: { ...s.room, mode, serverNow: Date.now() } })),
       addTrack: async (input: string) => {
         const t = await resolveTrack(input);
-        let outcome: "queued" | "requested" = "queued";
+        const outcome = !asHost && state.room.mode === "approval" ? "requested" : "queued";
         setState((s) => {
-          const isHost = s.room.hostId === user.id;
-          if (!isHost && s.room.mode === "approval") {
-            outcome = "requested";
+          if (outcome === "requested") {
             return {
               ...s,
               requests: [...s.requests, { _id: nanoid(8), requestedBy: user.id, requestedByName: user.name, ...t }],
@@ -220,6 +265,7 @@ export function useDemoRoom(slug: string, user: LocalUser) {
                 title: r.title,
                 author: r.author,
                 thumbnail: r.thumbnail,
+                source: r.source,
               },
             ],
           };
@@ -232,7 +278,7 @@ export function useDemoRoom(slug: string, user: LocalUser) {
           messages: [...s.messages, { _id: nanoid(8), userId: user.id, name: user.name, text }],
         })),
     }),
-    [user.id, user.name],
+    [user.id, user.name, asHost, state.room.mode],
   );
 
   // Keep the seeded listener/queue names in step with a rename, and let the

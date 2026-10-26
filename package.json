@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test scripts/local-store.test.mjs scripts/check-youtube-player.mjs scripts/check-room-behavior.mjs"
   },
   "dependencies": {
     "class-variance-authority": "^0.7.1",

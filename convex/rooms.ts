@@ -1,23 +1,43 @@
 import { v } from "convex/values";
 import { mutation, query, type MutationCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
+import { cleanRoomName } from "./validate";
 
 const ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
-function makeSlug(len = 6) {
+/**
+ * The room code is the only thing between a stranger and a room, so it has to
+ * be long enough that enumerating codes isn't worth anyone's time: ten
+ * characters of this alphabet is a little under 50 bits. Convex gives queries
+ * and mutations a seeded strong PRNG at `Math.random()` and refuses
+ * cryptographic randomness outright, so this is the strongest source available
+ * inside a mutation.
+ */
+const CODE_LENGTH = 10;
+/** A host token is made in the browser, where real randomness exists. */
+const MIN_HOST_TOKEN = 32;
+/** No real track ends within a second of starting; see `ended`. */
+const MIN_PLAY_MS = 5_000;
+
+function makeSlug(len = CODE_LENGTH) {
   let s = "";
   for (let i = 0; i < len; i++)
     s += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
   return s;
 }
 
+/** True when this caller holds the room's host token. */
+export function holdsHostToken(room: Doc<"rooms">, hostToken?: string) {
+  return !!room.hostToken && !!hostToken && room.hostToken === hostToken;
+}
+
 export async function requireHost(
   ctx: MutationCtx,
   roomId: Id<"rooms">,
-  userId: string,
+  hostToken: string,
 ) {
   const room = await ctx.db.get(roomId);
   if (!room) throw new Error("Room not found");
-  if (room.hostId !== userId) throw new Error("Only the host can do that");
+  if (!holdsHostToken(room, hostToken)) throw new Error("Only the host can do that");
   return room;
 }
 
@@ -46,6 +66,7 @@ export async function advance(ctx: MutationCtx, room: Doc<"rooms">) {
       title: next.title,
       author: next.author,
       thumbnail: next.thumbnail,
+      source: next.source,
     },
     isPlaying: true,
     startedAt: now,
@@ -55,8 +76,9 @@ export async function advance(ctx: MutationCtx, room: Doc<"rooms">) {
 }
 
 export const create = mutation({
-  args: { name: v.string(), hostId: v.string() },
-  handler: async (ctx, { name, hostId }) => {
+  args: { name: v.string(), hostId: v.string(), hostToken: v.string() },
+  handler: async (ctx, { name, hostId, hostToken }) => {
+    if (hostToken.length < MIN_HOST_TOKEN) throw new Error("Host token is too short");
     let slug = makeSlug();
     while (
       await ctx.db
@@ -69,8 +91,9 @@ export const create = mutation({
     const now = Date.now();
     await ctx.db.insert("rooms", {
       slug,
-      name: name.trim() || "untitled room",
+      name: cleanRoomName(name),
       hostId,
+      hostToken,
       mode: "approval",
       isPlaying: false,
       startedAt: now,
@@ -89,15 +112,33 @@ export const getBySlug = query({
       .withIndex("by_slug", (q) => q.eq("slug", slug))
       .unique();
     if (!room) return null;
-    // Expose server time so clients can compute clock offset for sync.
-    return { ...room, serverNow: Date.now() };
+    /**
+     * Named one by one on purpose. The host token is this room's only
+     * credential and must never leave the server, and spreading the row would
+     * publish whatever the schema gains next without anyone noticing.
+     */
+    return {
+      _id: room._id,
+      _creationTime: room._creationTime,
+      slug: room.slug,
+      name: room.name,
+      hostId: room.hostId,
+      mode: room.mode,
+      current: room.current,
+      isPlaying: room.isPlaying,
+      startedAt: room.startedAt,
+      pausedAt: room.pausedAt,
+      lastActiveAt: room.lastActiveAt,
+      // Expose server time so clients can compute clock offset for sync.
+      serverNow: Date.now(),
+    };
   },
 });
 
 export const play = mutation({
-  args: { roomId: v.id("rooms"), userId: v.string() },
-  handler: async (ctx, { roomId, userId }) => {
-    const room = await requireHost(ctx, roomId, userId);
+  args: { roomId: v.id("rooms"), hostToken: v.string() },
+  handler: async (ctx, { roomId, hostToken }) => {
+    const room = await requireHost(ctx, roomId, hostToken);
     if (!room.current) {
       await advance(ctx, room);
       return;
@@ -113,9 +154,9 @@ export const play = mutation({
 });
 
 export const pause = mutation({
-  args: { roomId: v.id("rooms"), userId: v.string() },
-  handler: async (ctx, { roomId, userId }) => {
-    const room = await requireHost(ctx, roomId, userId);
+  args: { roomId: v.id("rooms"), hostToken: v.string() },
+  handler: async (ctx, { roomId, hostToken }) => {
+    const room = await requireHost(ctx, roomId, hostToken);
     if (!room.isPlaying) return;
     const now = Date.now();
     await ctx.db.patch(roomId, {
@@ -127,32 +168,40 @@ export const pause = mutation({
 });
 
 export const seek = mutation({
-  args: { roomId: v.id("rooms"), userId: v.string(), positionMs: v.number() },
-  handler: async (ctx, { roomId, userId, positionMs }) => {
-    const room = await requireHost(ctx, roomId, userId);
+  args: { roomId: v.id("rooms"), hostToken: v.string(), positionMs: v.number() },
+  handler: async (ctx, { roomId, hostToken, positionMs }) => {
+    const room = await requireHost(ctx, roomId, hostToken);
+    const position = Number.isFinite(positionMs) ? Math.max(0, positionMs) : 0;
     const now = Date.now();
     await ctx.db.patch(roomId, {
-      startedAt: now - positionMs,
-      pausedAt: room.isPlaying ? 0 : positionMs,
+      startedAt: now - position,
+      pausedAt: room.isPlaying ? 0 : position,
       lastActiveAt: now,
     });
   },
 });
 
 export const skip = mutation({
-  args: { roomId: v.id("rooms"), userId: v.string() },
-  handler: async (ctx, { roomId, userId }) => {
-    const room = await requireHost(ctx, roomId, userId);
+  args: { roomId: v.id("rooms"), hostToken: v.string() },
+  handler: async (ctx, { roomId, hostToken }) => {
+    const room = await requireHost(ctx, roomId, hostToken);
     await advance(ctx, room);
   },
 });
 
-/** Called by any client when the current track ends. Idempotent-ish via videoId check. */
+/**
+ * Reported by whichever browser notices the current track finish, so it cannot
+ * require the host token. The guards below throw out the reports that can't be
+ * real — a paused room has nothing to finish, and nothing finishes in the first
+ * few seconds — which stops a listener from using this to skip the room's music.
+ */
 export const ended = mutation({
   args: { roomId: v.id("rooms"), videoId: v.string() },
   handler: async (ctx, { roomId, videoId }) => {
     const room = await ctx.db.get(roomId);
     if (!room || room.current?.videoId !== videoId) return;
+    if (!room.isPlaying) return;
+    if (Date.now() - room.startedAt < MIN_PLAY_MS) return;
     await advance(ctx, room);
   },
 });
@@ -160,11 +209,11 @@ export const ended = mutation({
 export const setMode = mutation({
   args: {
     roomId: v.id("rooms"),
-    userId: v.string(),
+    hostToken: v.string(),
     mode: v.union(v.literal("open"), v.literal("approval")),
   },
-  handler: async (ctx, { roomId, userId, mode }) => {
-    await requireHost(ctx, roomId, userId);
+  handler: async (ctx, { roomId, hostToken, mode }) => {
+    await requireHost(ctx, roomId, hostToken);
     await ctx.db.patch(roomId, { mode });
   },
 });

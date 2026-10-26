@@ -4,7 +4,6 @@ import { useAction, useMutation, useQuery } from "convex/react";
 import Link from "next/link";
 import {
   Check,
-  Copy,
   ListMusic,
   Pause,
   Play,
@@ -20,25 +19,49 @@ import {
   ArrowDown,
   Lock,
   Unlock,
+  Music2,
+  ArrowLeft,
+  ChevronRight,
+  Headphones,
+  Link2,
+  LoaderCircle,
+  MessageCircle,
+  MoreHorizontal,
+  Pencil,
+  Send,
+  TvMinimalPlay,
 } from "lucide-react";
 import { api } from "../../../../convex/_generated/api";
 import type { Id } from "../../../../convex/_generated/dataModel";
-import { useLocalUser } from "@/lib/user";
+import { useGuestNameConfirmed, useLocalUser } from "@/lib/user";
+import { useHostToken } from "@/lib/host-token";
 import { useLocalVolume } from "@/lib/volume";
 import { isDemo, useDemoRoom } from "@/lib/demo";
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
-import { Badge } from "@/components/ui/badge";
 import { YouTubePlayer } from "@/components/youtube-player";
+import { SpotifyPlayer } from "@/components/spotify-player";
+import { useSpotify } from "@/lib/spotify-auth";
+import { detectSource, type Source } from "@/lib/track-source";
 import { DemoBanner } from "@/components/demo-banner";
 import { cn } from "@/lib/utils";
+import { Avatar, Brand, NameGate, ThemeToggle } from "@/components/app-chrome";
+import { RoomInvite } from "@/components/room-invite";
+import { useRoomConnected } from "@/components/connection-status";
+import "./room.css";
 
 /**
  * The room renders from plain data plus a set of actions, so it can be driven by
  * Convex (RoomLive) or by the local demo store (RoomDemo) with no change to the UI.
  */
-type Track = { videoId: string; title: string; author: string; thumbnail: string };
+type Track = {
+  /** YouTube video id, or Spotify track id. */
+  videoId: string;
+  title: string;
+  author: string;
+  thumbnail: string;
+  source?: Source;
+};
 
 type RoomData = {
   _id: string;
@@ -60,23 +83,27 @@ type RoomContents = {
   messages: { _id: string; userId: string; name: string; text: string }[];
 };
 
+type ActionResult = void | Promise<unknown>;
+
 type RoomActions = {
-  play: () => void;
-  pause: () => void;
-  skip: () => void;
-  ended: (videoId: string) => void;
-  setMode: (mode: "open" | "approval") => void;
+  play: () => ActionResult;
+  pause: () => ActionResult;
+  skip: () => ActionResult;
+  ended: (videoId: string) => ActionResult;
+  setMode: (mode: "open" | "approval") => ActionResult;
   addTrack: (input: string) => Promise<"queued" | "requested">;
-  removeTrack: (id: string) => void;
-  moveTrack: (id: string, direction: "up" | "down") => void;
-  approve: (id: string) => void;
-  reject: (id: string) => void;
-  sendMessage: (text: string) => void;
+  removeTrack: (id: string) => ActionResult;
+  moveTrack: (id: string, direction: "up" | "down") => ActionResult;
+  approve: (id: string) => ActionResult;
+  reject: (id: string) => ActionResult;
+  sendMessage: (text: string) => ActionResult;
 };
 
 export function Room({ slug }: { slug: string }) {
   const [user, rename] = useLocalUser();
-  if (!user) return <Centered>loading…</Centered>;
+  const [confirmed, confirmName] = useGuestNameConfirmed();
+  if (!user) return <Centered><LoaderCircle size={24} className="room-spinner" /><p>Opening the room…</p></Centered>;
+  if (!confirmed) return <NameGate defaultName={user.name} onComplete={(name) => { rename(name); confirmName(); }} />;
   return isDemo ? (
     <RoomDemo slug={slug} user={user} rename={rename} />
   ) : (
@@ -97,11 +124,13 @@ function RoomLive({
 }) {
   const room = useQuery(api.rooms.getBySlug, { slug });
   const roomId = room?._id;
+  // Held only by the browser that created the room; the server never sends it.
+  const hostToken = useHostToken(slug);
 
-  const queue = useQuery(api.queue.list, roomId ? { roomId } : "skip") ?? [];
-  const requests = useQuery(api.requests.pending, roomId ? { roomId } : "skip") ?? [];
-  const listeners = useQuery(api.presence.list, roomId ? { roomId } : "skip") ?? [];
-  const messages = useQuery(api.messages.list, roomId ? { roomId } : "skip") ?? [];
+  const queue = useQuery(api.queue.list, roomId ? { roomId } : "skip");
+  const requests = useQuery(api.requests.pending, roomId ? { roomId } : "skip");
+  const listeners = useQuery(api.presence.list, roomId ? { roomId } : "skip");
+  const messages = useQuery(api.messages.list, roomId ? { roomId } : "skip");
 
   const play = useMutation(api.rooms.play);
   const pause = useMutation(api.rooms.pause);
@@ -117,56 +146,67 @@ function RoomLive({
   const leave = useMutation(api.presence.leave);
   const sendMessage = useMutation(api.messages.send);
   const resolve = useAction(api.youtube.resolve);
+  const resolveSpotify = useAction(api.spotify.resolve);
 
   // ---- presence heartbeat
   useEffect(() => {
     if (!roomId) return;
-    heartbeat({ roomId, userId: user.id, name: user.name });
+    void heartbeat({ roomId, userId: user.id, name: user.name }).catch(() => {});
     const t = setInterval(
-      () => heartbeat({ roomId, userId: user.id, name: user.name }),
+      () => void heartbeat({ roomId, userId: user.id, name: user.name }).catch(() => {}),
       10_000,
     );
-    const onUnload = () => leave({ roomId, userId: user.id });
+    const onUnload = () => void leave({ roomId, userId: user.id }).catch(() => {});
     window.addEventListener("beforeunload", onUnload);
     return () => {
       clearInterval(t);
       window.removeEventListener("beforeunload", onUnload);
-      leave({ roomId, userId: user.id });
+      void leave({ roomId, userId: user.id }).catch(() => {});
     };
   }, [roomId, user.id, user.name, heartbeat, leave]);
 
   const actions: RoomActions = useMemo(() => {
     const id = roomId as Id<"rooms">;
     const who = { roomId: id, userId: user.id };
+    // Host-only mutations carry the room's host token. The rest carry the
+    // public guest id, which is all they are entitled to decide anything on.
+    const asHost = { roomId: id, hostToken: hostToken ?? "" };
     return {
-      play: () => void play(who),
-      pause: () => void pause(who),
-      skip: () => void skip(who),
-      ended: (videoId) => void ended({ roomId: id, videoId }),
-      setMode: (mode) => void setMode({ ...who, mode }),
+      play: () => play(asHost),
+      pause: () => pause(asHost),
+      skip: () => skip(asHost),
+      ended: (videoId) => ended({ roomId: id, videoId }),
+      setMode: (mode) => setMode({ ...asHost, mode }),
       addTrack: async (input) => {
-        const track = await resolve({ input });
-        return addTrack({ ...who, userName: user.name, track });
+        const source = detectSource(input);
+        if (!source) throw new Error("paste a YouTube or Spotify track link");
+        const track =
+          source === "spotify"
+            ? await resolveSpotify({ input })
+            : { ...(await resolve({ input })), source: "youtube" as const };
+        return addTrack({ ...who, userName: user.name, track, hostToken: hostToken ?? undefined });
       },
-      removeTrack: (itemId) => void removeTrack({ ...who, itemId: itemId as Id<"queue"> }),
+      removeTrack: (itemId) =>
+        removeTrack({ ...who, itemId: itemId as Id<"queue">, hostToken: hostToken ?? undefined }),
       moveTrack: (itemId, direction) =>
-        void moveTrack({ ...who, itemId: itemId as Id<"queue">, direction }),
-      approve: (requestId) => void approve({ ...who, requestId: requestId as Id<"requests"> }),
-      reject: (requestId) => void reject({ ...who, requestId: requestId as Id<"requests"> }),
-      sendMessage: (text) => void sendMessage({ ...who, name: user.name, text }),
+        moveTrack({ ...asHost, itemId: itemId as Id<"queue">, direction }),
+      approve: (requestId) => approve({ ...asHost, requestId: requestId as Id<"requests"> }),
+      reject: (requestId) => reject({ ...asHost, requestId: requestId as Id<"requests"> }),
+      sendMessage: (text) => sendMessage({ ...who, name: user.name, text }),
     };
-  }, [roomId, user.id, user.name, play, pause, skip, ended, setMode, resolve, addTrack, removeTrack, moveTrack, approve, reject, sendMessage]);
+  }, [roomId, hostToken, user.id, user.name, play, pause, skip, ended, setMode, resolve, resolveSpotify, addTrack, removeTrack, moveTrack, approve, reject, sendMessage]);
 
-  if (room === undefined) return <Centered>loading…</Centered>;
+  if (room === undefined || (room && (!queue || !requests || !listeners || !messages))) return <Centered><LoaderCircle size={24} className="room-spinner" /><p>Opening the room…</p></Centered>;
   if (room === null) return <NotFound />;
 
   return (
     <RoomView
       room={room}
-      contents={{ queue, requests, listeners, messages }}
+      contents={{ queue: queue!, requests: requests!, listeners: listeners!, messages: messages! }}
       actions={actions}
       user={user}
       rename={rename}
+      canHost={!!hostToken}
     />
   );
 }
@@ -196,6 +236,7 @@ function RoomDemo({
         actions={actions}
         user={user}
         rename={rename}
+        canHost={asHost}
       />
     </>
   );
@@ -209,16 +250,19 @@ function RoomView({
   actions,
   user,
   rename,
+  canHost,
 }: {
   room: RoomData;
   contents: RoomContents;
   actions: RoomActions;
   user: { id: string; name: string };
   rename: (n: string) => void;
+  /** Whether this browser holds the room's host token. */
+  canHost?: boolean;
 }) {
-  const isHost = room.hostId === user.id;
-
-  // ---- clock sync: estimate serverNow - clientNow from each room update
+  // `room.hostId` still labels the host in the room; it no longer grants
+  // anything, so the controls follow the capability this browser actually has.
+  const isHost = canHost ?? room.hostId === user.id;
   const offsetRef = useRef(0);
   useEffect(() => {
     offsetRef.current = room.serverNow - Date.now();
@@ -228,302 +272,340 @@ function RoomView({
     return Date.now() + offsetRef.current - room.startedAt;
   }, [room.isPlaying, room.pausedAt, room.startedAt]);
 
-  // ---- local volume (never synced)
   const [volume, setVolume] = useLocalVolume();
   const VolumeIcon = volume === 0 ? VolumeX : volume < 50 ? Volume1 : Volume2;
-
-  // ---- add track
   const [input, setInput] = useState("");
   const [adding, setAdding] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ text: string; error: boolean } | null>(null);
+  const addInputRef = useRef<HTMLInputElement>(null);
   async function onAdd() {
-    if (!input.trim()) return;
+    if (!input.trim() || adding || !connected) return;
     setAdding(true);
     setNotice(null);
     try {
-      const result = await actions.addTrack(input);
+      const result = await actions.addTrack(input.trim());
       setInput("");
-      setNotice(result === "requested" ? "sent to host for approval" : "added to queue");
+      setNotice({ text: result === "requested" ? "Sent to the host for approval." : "Added to the queue.", error: false });
     } catch (e) {
-      setNotice(e instanceof Error ? e.message : "couldn't add that");
+      setNotice({ text: e instanceof Error ? e.message : "Couldn't add that track. Check the link and try again.", error: true });
     } finally {
       setAdding(false);
-      setTimeout(() => setNotice(null), 3000);
     }
   }
 
-  // ---- chat
-  const [chat, setChat] = useState("");
-  const chatEndRef = useRef<HTMLDivElement>(null);
-  const chatMounted = useRef(false);
-  useEffect(() => {
-    // Skip the first run: on narrow screens scrolling the chat into view on load
-    // would drag the whole page past the player.
-    if (!chatMounted.current) {
-      chatMounted.current = true;
-      return;
-    }
-    chatEndRef.current?.scrollIntoView({ block: "end" });
-  }, [messages.length]);
+  const connected = useRoomConnected();
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [pendingActions, setPendingActions] = useState<Set<string>>(new Set());
+  const actionLocks = useRef(new Set<string>());
+  async function runAction(key: string, action: () => ActionResult) {
+    // End-of-track is a one-shot provider event. Let Convex queue that event
+    // across a disconnect; only interactive changes wait for reconnection.
+    if ((!connected && key !== "advance") || actionLocks.current.has(key)) return;
+    actionLocks.current.add(key);
+    setPendingActions(new Set(actionLocks.current));
+    setActionError(null);
+    try { await action(); }
+    catch { setActionError("That change didn’t reach the room. Try again when you’re connected."); }
+    finally { actionLocks.current.delete(key); setPendingActions(new Set(actionLocks.current)); }
+  }
 
-  // ---- copy link
-  const [copied, setCopied] = useState(false);
-  function copyLink() {
-    navigator.clipboard.writeText(window.location.href).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
+  const [chat, setChat] = useState("");
+  const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const followChat = useRef(true);
+  const lastMessageId = messages.at(-1)?._id ?? null;
+  const [readMessageId, setReadMessageId] = useState(lastMessageId);
+  const [chatInView, setChatInView] = useState(false);
+  const [socialPanel, setSocialPanel] = useState<"chat" | "people">("chat");
+  const [mobilePanel, setMobilePanel] = useState<"player" | "queue" | "chat" | "people">("player");
+  const unreadStart = messages.findIndex(message => message._id === readMessageId);
+  const unreadMessages = readMessageId === lastMessageId ? 0 : messages.slice(unreadStart < 0 ? 0 : unreadStart + 1).filter(message => message.userId !== user.id).length;
+
+  function showLatestMessages() {
+    const container = chatScrollRef.current;
+    if (container) container.scrollTop = container.scrollHeight;
+    followChat.current = true;
+    setReadMessageId(lastMessageId);
+  }
+  useEffect(() => {
+    const container = chatScrollRef.current;
+    if (!container) return;
+    let intersecting = false;
+    const syncVisibility = () => setChatInView(intersecting && !document.hidden);
+    const observer = new IntersectionObserver(([entry]) => {
+      intersecting = entry.isIntersecting && entry.intersectionRatio >= .2;
+      syncVisibility();
+    }, { threshold: [0, .2], rootMargin: "0px 0px -72px 0px" });
+    observer.observe(container);
+    document.addEventListener("visibilitychange", syncVisibility);
+    return () => { observer.disconnect(); document.removeEventListener("visibilitychange", syncVisibility); };
+  }, []);
+  useEffect(() => {
+    const container = chatScrollRef.current;
+    if (container && chatInView && followChat.current && !document.hidden) {
+      container.scrollTop = container.scrollHeight;
+      // Message ids, rather than count, still change when the 100-message window rolls.
+      setReadMessageId(lastMessageId);
+    }
+  }, [lastMessageId, mobilePanel, socialPanel, chatInView]);
+
+  async function onSendMessage() {
+    const text = chat.trim();
+    if (!text || !connected || sendingRef.current) return;
+    sendingRef.current = true;
+    setSending(true);
+    setChatError(null);
+    try {
+      await actions.sendMessage(text);
+      setChat(current => current.trim() === text ? "" : current);
+      followChat.current = true;
+      showLatestMessages();
+    } catch { setChatError("Message not sent. Your draft is safe—try again."); }
+    finally { sendingRef.current = false; setSending(false); }
   }
 
   const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState(user.name);
+  const nameButtonRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
   const syncKey = useMemo(() => room.startedAt + room.pausedAt, [room.startedAt, room.pausedAt]);
+  const toggle =
+    isHost && (room.current || queue.length > 0)
+      ? () => void runAction("playback", room.isPlaying ? actions.pause : actions.play)
+      : undefined;
+  const host = listeners.find((listener) => listener.userId === room.hostId);
+
+  function saveName() {
+    if (nameDraft.trim()) rename(nameDraft);
+    setEditingName(false);
+    requestAnimationFrame(() => nameButtonRef.current?.focus());
+  }
+  function openMobilePanel(panel: "player" | "queue" | "chat" | "people") {
+    setMobilePanel(panel);
+    if (panel === "chat" || panel === "people") setSocialPanel(panel);
+    requestAnimationFrame(() => {
+      const target = panel === "player" ? document.querySelector(".room-listening") : panelRef.current;
+      target?.scrollIntoView({ block: "start", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" });
+    });
+  }
 
   return (
-    <main className="flex flex-1 flex-col lg:flex-row gap-4 p-4 lg:h-dvh lg:overflow-hidden">
-      {/* ---------- left: player + controls ---------- */}
-      <section className="flex flex-col gap-3 lg:flex-[3] min-w-0">
-        <header className="flex items-center justify-between gap-3">
-          <div className="min-w-0">
-            <h1 className="truncate font-semibold text-lg leading-tight">{room.name}</h1>
-            <p className="text-xs text-muted-foreground font-mono">/r/{room.slug}</p>
-          </div>
-          <div className="flex items-center gap-2">
-            {isHost && <Badge variant="secondary">host</Badge>}
-            <Button variant="outline" size="sm" onClick={copyLink}>
-              {copied ? <Check /> : <Copy />} {copied ? "copied" : "invite"}
-            </Button>
-          </div>
-        </header>
+    <main className="room-app" data-mobile-panel={mobilePanel}>
+      <header className="room-topbar">
+        <div className="room-topbar-left">
+          <Brand compact />
+          <span className="room-topbar-divider" aria-hidden="true" />
+          <span className="room-breadcrumb"><Headphones size={15} /><span>Listening room</span><ChevronRight size={13} /><span>{room.slug}</span></span>
+        </div>
+        <div className="room-topbar-actions">
+          <ThemeToggle />
+          <RoomInvite slug={room.slug} roomName={room.name} />
+        </div>
+      </header>
 
-        <YouTubePlayer
-          videoId={room.current?.videoId ?? null}
-          isPlaying={room.isPlaying}
-          syncKey={syncKey}
-          getTargetMs={getTargetMs}
-          volume={volume}
-          onEnded={() => room.current && actions.ended(room.current.videoId)}
-          onToggle={
-            isHost && (room.current || queue.length > 0)
-              ? () => (room.isPlaying ? actions.pause() : actions.play())
-              : undefined
-          }
-        />
+      {actionError && <div className="room-action-error" role="alert"><span>{actionError}</span><button type="button" className="room-icon-button" aria-label="Dismiss error" onClick={() => setActionError(null)}><X size={16} /></button></div>}
 
-        <div className="flex flex-col gap-3 rounded-xl border bg-card p-4">
-          <div className="flex items-center justify-between gap-3">
-            <div className="min-w-0">
-              {room.current ? (
-                <>
-                  <p className="truncate font-medium">{room.current.title}</p>
-                  <p className="truncate text-sm text-muted-foreground">{room.current.author}</p>
-                </>
-              ) : (
-                <p className="text-muted-foreground">add a song below to get started</p>
-              )}
+      <div className="room-body">
+        <div className="room-heading">
+          <div>
+            <Link href="/" className="room-back-link"><ArrowLeft size={14} /> Back to home</Link>
+            <h1>{room.name}</h1>
+            <div className="room-heading-meta">
+              <span><Headphones size={14} />{listeners.length} {listeners.length === 1 ? "person" : "people"} listening</span>
+              <span className="room-meta-dot" aria-hidden="true" />
+              <span>{isHost ? "You're the host" : host ? `Hosted by ${host.name}` : "Shared listening room"}</span>
             </div>
-            {isHost && (
-              <div className="flex shrink-0 gap-1">
-                {room.isPlaying ? (
-                  <Button size="icon" variant="secondary" onClick={actions.pause} aria-label="pause">
-                    <Pause />
-                  </Button>
+          </div>
+          <div className="room-avatars" aria-label={`${listeners.length} people in the room`}>
+            {listeners.slice(0, 4).map((listener) => <Avatar key={listener._id} name={listener.name} />)}
+            {listeners.length > 4 && <span className="room-avatar-overflow">+{listeners.length - 4}</span>}
+          </div>
+        </div>
+
+        <div className="room-layout">
+          <section className="room-listening" aria-label="Music player">
+            <div className="room-player">
+              <div className="room-player-label">
+                <span className="room-play-state"><span className={cn("room-equalizer", room.isPlaying && "is-playing")} aria-hidden="true"><i /><i /><i /></span>{room.current ? room.isPlaying ? "Now playing" : "Playback paused" : "Ready when you are"}</span>
+                <span className="room-source-label">{room.current?.source === "spotify" ? <><Music2 size={13} /> Spotify</> : <><TvMinimalPlay size={15} /> YouTube</>}</span>
+              </div>
+              <div className="room-player-screen">
+                {room.current?.source === "spotify" ? (
+                  <SpotifyPlayer
+                    trackId={room.current.videoId}
+                    isPlaying={room.isPlaying}
+                    syncKey={syncKey}
+                    getTargetMs={getTargetMs}
+                    volume={volume}
+                    artwork={room.current.thumbnail}
+                    onEnded={() => { if (room.current) void runAction("advance", () => actions.ended(room.current!.videoId)); }}
+                    onToggle={toggle}
+                  />
                 ) : (
-                  <Button size="icon" onClick={actions.play} aria-label="play" disabled={!room.current && queue.length === 0}>
-                    <Play />
-                  </Button>
+                  <YouTubePlayer
+                    videoId={room.current?.videoId ?? null}
+                    isPlaying={room.isPlaying}
+                    syncKey={syncKey}
+                    getTargetMs={getTargetMs}
+                    volume={volume}
+                    onEnded={() => { if (room.current) void runAction("advance", () => actions.ended(room.current!.videoId)); }}
+                    onToggle={toggle}
+                  />
                 )}
-                <Button size="icon" variant="secondary" onClick={actions.skip} aria-label="skip" disabled={!room.current}>
-                  <SkipForward />
-                </Button>
+              </div>
+              <div className="room-now-playing">
+                <div className="room-track-heading">
+                  <h2>{room.current?.title ?? "The next good song starts with you."}</h2>
+                  <p>{room.current?.author ?? "Add a YouTube or Spotify track to get the room going."}</p>
+                </div>
+                {isHost && (
+                  <div className="room-playback-controls">
+                    <button type="button" className="room-play-button" onClick={() => void runAction("playback", room.isPlaying ? actions.pause : actions.play)} aria-label={room.isPlaying ? "Pause playback" : "Play music"} disabled={!connected || pendingActions.has("playback") || (!room.current && queue.length === 0)}>
+                      {room.isPlaying ? <Pause size={22} fill="currentColor" /> : <Play size={22} fill="currentColor" />}
+                    </button>
+                    <button type="button" className="room-icon-button room-skip-button" onClick={() => void runAction("skip", actions.skip)} aria-label="Skip to the next track" disabled={!connected || pendingActions.has("skip") || !room.current}><SkipForward size={20} fill="currentColor" /></button>
+                  </div>
+                )}
+              </div>
+              <div className="room-player-footer">
+                <span className="room-host-note">{isHost ? "You control what plays." : "The host controls playback."}</span>
+                <div className="room-volume">
+                  <button type="button" className="room-icon-button" onClick={() => setVolume(volume === 0 ? 60 : 0)} aria-label={volume === 0 ? "Unmute your audio" : "Mute your audio"}><VolumeIcon size={17} /></button>
+                  <Slider value={[volume]} max={100} step={1} onValueChange={([v]) => setVolume(v)} aria-label="Your volume" className="room-volume-slider" />
+                  <span className="room-volume-value">{volume}%</span>
+                  <span className="room-volume-hint">Just you</span>
+                </div>
+              </div>
+            </div>
+
+            <form className="room-add-track" onSubmit={(e) => { e.preventDefault(); void onAdd(); }}>
+              <div className="room-add-track-label"><Plus size={16} /><label htmlFor="room-track-link">{isHost || room.mode === "open" ? "Bring your taste to the queue" : "Got a good one? Send a request"}</label></div>
+              <div className="room-add-track-fields">
+                <div className="room-track-input-wrap"><Link2 size={17} /><Input id="room-track-link" ref={addInputRef} placeholder="YouTube or Spotify track link" value={input} onChange={(e) => { setInput(e.target.value); if (notice) setNotice(null); }} disabled={adding} autoComplete="off" /></div>
+                <button className="room-button room-button-accent" type="submit" disabled={!connected || adding || !input.trim()}>{adding ? <LoaderCircle size={16} className="room-spinner" /> : <Plus size={16} />}<span>{adding ? "Adding…" : isHost || room.mode === "open" ? "Add track" : "Request track"}</span></button>
+              </div>
+              {notice && <p className={cn("room-notice", notice.error && "room-notice-error")} role={notice.error ? "alert" : "status"}>{notice.error ? <X size={13} /> : <Check size={13} />}{notice.text}</p>}
+            </form>
+          </section>
+
+          <nav className="room-mobile-tabs" aria-label="Room sections">
+            <button type="button" aria-pressed={mobilePanel === "player"} onClick={() => openMobilePanel("player")}><Headphones size={17} />Player</button>
+            <button type="button" aria-pressed={mobilePanel === "queue"} onClick={() => openMobilePanel("queue")}><ListMusic size={17} />Queue<span>{queue.length}</span></button>
+            <button type="button" aria-pressed={mobilePanel === "chat"} onClick={() => openMobilePanel("chat")}><MessageCircle size={16} />Chat{unreadMessages > 0 && <span className="room-unread" aria-label={`${unreadMessages} unread messages`}>{unreadMessages > 99 ? "99+" : unreadMessages}</span>}</button>
+            <button type="button" aria-pressed={mobilePanel === "people"} onClick={() => openMobilePanel("people")}><Users size={17} />People<span>{listeners.length}</span></button>
+          </nav>
+
+          <span ref={panelRef} className="room-panel-anchor" aria-hidden="true" />
+          <section className="room-queue" aria-label="Music queue">
+            <div className="room-section-heading">
+              <h2>Up next <span>{queue.length}</span></h2>
+              {isHost ? <button type="button" className="room-mode-toggle" disabled={!connected || pendingActions.has("mode")} onClick={() => void runAction("mode", () => actions.setMode(room.mode === "open" ? "approval" : "open"))} title="Change who can add tracks">{room.mode === "open" ? <Unlock size={13} /> : <Lock size={13} />}{room.mode === "open" ? "Anyone can add" : "Host approval"}<ChevronRight size={12} /></button> : <span className="room-queue-mode">{room.mode === "open" ? "Everyone can add tracks" : "Requests go to the host"}</span>}
+            </div>
+
+            {isHost && requests.length > 0 && (
+              <div className="room-requests">
+                <div className="room-requests-heading"><span><Headphones size={14} /> Track requests <span>{requests.length}</span></span><small>Pick what joins the queue</small></div>
+                {requests.map((request) => (
+                  <TrackRow key={request._id} title={request.title} author={request.author} thumb={request.thumbnail} by={request.requestedByName} source={request.source} requested>
+                    <button type="button" className="room-icon-button room-approve-button" disabled={!connected || pendingActions.has(request._id)} onClick={() => void runAction(request._id, () => actions.approve(request._id))} aria-label={`Approve ${request.title}`}><Check size={17} /><span className="room-track-action-label">Approve</span></button>
+                    <button type="button" className="room-icon-button" disabled={!connected || pendingActions.has(request._id)} onClick={() => void runAction(request._id, () => actions.reject(request._id))} aria-label={`Decline ${request.title}`}><X size={16} /><span className="room-track-action-label">Decline</span></button>
+                  </TrackRow>
+                ))}
               </div>
             )}
-          </div>
 
-          {/* local volume */}
-          <div className="flex items-center gap-3">
-            <button
-              className="text-muted-foreground hover:text-foreground cursor-pointer"
-              onClick={() => setVolume(volume === 0 ? 60 : 0)}
-              aria-label="mute"
-            >
-              <VolumeIcon className="size-5" />
-            </button>
-            <Slider value={[volume]} max={100} step={1} onValueChange={([v]) => setVolume(v)} className="flex-1" />
-            <span className="w-8 text-right text-xs tabular-nums text-muted-foreground">{volume}</span>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            volume is just yours — turn it down to talk, everyone else stays loud.
-          </p>
+            {queue.length === 0 ? (
+              <div className="room-empty-queue"><ListMusic size={26} /><div><h3>There’s room for a good song.</h3><p>Add a track above and make it the next one.</p></div><button type="button" className="room-text-button" onClick={() => { addInputRef.current?.focus(); addInputRef.current?.scrollIntoView({ behavior: "smooth", block: "center" }); }}>Add a track <Plus size={14} /></button></div>
+            ) : (
+              <div className="room-track-list">
+                {queue.map((track, index) => (
+                  <TrackRow key={track._id} title={track.title} author={track.author} thumb={track.thumbnail} by={track.addedByName} source={track.source} position={index + 1} hasActions={isHost || track.addedBy === user.id}>
+                    {isHost && <><button type="button" className="room-icon-button" disabled={!connected || pendingActions.has(track._id) || index === 0} onClick={() => void runAction(track._id, () => actions.moveTrack(track._id, "up"))} aria-label={`Move ${track.title} up`}><ArrowUp size={15} /><span className="room-track-action-label">Move up</span></button><button type="button" className="room-icon-button" disabled={!connected || pendingActions.has(track._id) || index === queue.length - 1} onClick={() => void runAction(track._id, () => actions.moveTrack(track._id, "down"))} aria-label={`Move ${track.title} down`}><ArrowDown size={15} /><span className="room-track-action-label">Move down</span></button></>}
+                    {(isHost || track.addedBy === user.id) && <button type="button" className="room-icon-button room-remove-button" disabled={!connected || pendingActions.has(track._id)} onClick={() => void runAction(track._id, () => actions.removeTrack(track._id))} aria-label={`Remove ${track.title}`}><Trash2 size={15} /><span className="room-track-action-label">Remove track</span></button>}
+                  </TrackRow>
+                ))}
+              </div>
+            )}
+            <div className="room-queue-footer"><span>Good music. Better company.</span><span><Music2 size={13} />YouTube & Spotify</span></div>
+          </section>
+
+          <aside className="room-social" data-social-panel={socialPanel} aria-label="People and chat">
+            <div className="room-social-heading"><h2>The room</h2><span><Users size={13} />{listeners.length}</span></div>
+            <div className="room-social-tabs" aria-label="Social sections"><button type="button" aria-pressed={socialPanel === "chat"} onClick={() => { setSocialPanel("chat"); followChat.current = true; }}><MessageCircle size={15} />Chat{unreadMessages > 0 && <span className="room-unread" aria-label={`${unreadMessages} unread messages`}>{unreadMessages > 99 ? "99+" : unreadMessages}</span>}</button><button type="button" aria-pressed={socialPanel === "people"} onClick={() => setSocialPanel("people")}><Users size={16} />People<span>{listeners.length}</span></button></div>
+
+            <section className="room-chat" aria-label="Room conversation">
+              <div ref={chatScrollRef} className="room-messages" onScroll={event => { const el = event.currentTarget; followChat.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60; if (followChat.current) setReadMessageId(lastMessageId); }} role="log" aria-live="polite" aria-label="Messages">
+                <div className="room-chat-welcome"><div className="room-chat-welcome-icon"><Headphones size={21} /></div><h3>You’re in good company.</h3><p>A shared queue. A place to catch up.<br />Make yourself at home.</p></div>
+                {messages.map((message) => (
+                  <div key={message._id} className={cn("room-message", message.userId === user.id && "room-message-own")}><Avatar name={message.name} size="sm" /><div><p className="room-message-name">{message.name}{message.userId === room.hostId && <span>Host</span>}{message.userId === user.id && <small>you</small>}</p><p className="room-message-text">{message.text}</p></div></div>
+                ))}
+              </div>
+              {unreadMessages > 0 && <button type="button" className="room-new-messages" onClick={showLatestMessages}>{unreadMessages} new {unreadMessages === 1 ? "message" : "messages"}<ArrowDown size={14} /></button>}
+              <form className="room-chat-form" aria-busy={sending} onSubmit={event => { event.preventDefault(); void onSendMessage(); }}><Input aria-label="Message the room" aria-describedby={chatError ? "chat-error" : undefined} value={chat} onChange={event => { setChat(event.target.value); setChatError(null); }} placeholder="Say something nice…" maxLength={500} /><button type="submit" className="room-icon-button room-send-button" disabled={!chat.trim() || sending || !connected} aria-label={sending ? "Sending message" : "Send message"}>{sending ? <LoaderCircle size={17} className="room-spinner" /> : <Send size={17} />}</button></form>
+              {chatError && <p className="room-chat-error" id="chat-error" role="alert">{chatError}</p>}
+
+            </section>
+
+            <section className="room-people" aria-label="People in the room">
+              <p className="room-people-caption">Different places. Same soundtrack.</p>
+              <ul>{listeners.map((listener) => <li key={listener._id}><Avatar name={listener.name} /><div><span>{listener.name}{listener.userId === user.id && <small>you</small>}</span><p>{listener.userId === room.hostId ? "Hosting the room" : "Here for the music"}</p></div>{listener.userId === room.hostId && <span className="room-host-badge">Host</span>}</li>)}</ul>
+            </section>
+
+            <div className="room-identity">
+              <Avatar name={user.name} size="sm" />
+              {editingName ? <form className="room-name-form" onSubmit={(e) => { e.preventDefault(); saveName(); }}><Input autoFocus aria-label="Your display name" value={nameDraft} maxLength={24} onChange={(e) => setNameDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Escape") { setEditingName(false); requestAnimationFrame(() => nameButtonRef.current?.focus()); } }} /><button type="submit" className="room-icon-button" aria-label="Save display name" disabled={!nameDraft.trim()}><Check size={15} /></button></form> : <><div><p>{user.name}</p><span>Here anonymously</span></div><button ref={nameButtonRef} type="button" className="room-icon-button" aria-label="Edit your display name" onClick={() => { setNameDraft(user.name); setEditingName(true); }}><Pencil size={14} /></button></>}
+            </div>
+            <SpotifyConnection />
+          </aside>
         </div>
-
-        {/* add / request */}
-        <div className="flex gap-2">
-          <Input
-            placeholder="paste a YouTube link…"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && onAdd()}
-            disabled={adding}
-          />
-          <Button onClick={onAdd} disabled={adding || !input.trim()}>
-            <Plus /> {isHost || room.mode === "open" ? "add" : "request"}
-          </Button>
-        </div>
-        {notice && <p className="text-xs text-muted-foreground -mt-1">{notice}</p>}
-      </section>
-
-      {/* ---------- right: queue / requests / people / chat ---------- */}
-      <aside className="flex flex-col gap-4 lg:flex-[2] min-w-0 lg:overflow-y-auto">
-        {/* mode toggle */}
-        {isHost && (
-          <Button
-            variant="outline"
-            size="sm"
-            className="justify-start"
-            onClick={() => actions.setMode(room.mode === "open" ? "approval" : "open")}
-          >
-            {room.mode === "open" ? <Unlock /> : <Lock />}
-            {room.mode === "open" ? "anyone can add to queue" : "requests need your approval"}
-          </Button>
-        )}
-
-        {/* requests */}
-        {isHost && requests.length > 0 && (
-          <Panel title={`requests · ${requests.length}`}>
-            {requests.map((r) => (
-              <TrackRow key={r._id} title={r.title} author={r.author} thumb={r.thumbnail} by={r.requestedByName}>
-                <Button size="icon-sm" onClick={() => actions.approve(r._id)} aria-label="approve">
-                  <Check />
-                </Button>
-                <Button size="icon-sm" variant="ghost" onClick={() => actions.reject(r._id)} aria-label="reject">
-                  <X />
-                </Button>
-              </TrackRow>
-            ))}
-          </Panel>
-        )}
-
-        {/* queue */}
-        <Panel title={<><ListMusic className="size-4" /> up next · {queue.length}</>}>
-          {queue.length === 0 && <p className="text-sm text-muted-foreground px-1">queue is empty</p>}
-          {queue.map((t, i) => (
-            <TrackRow key={t._id} title={t.title} author={t.author} thumb={t.thumbnail} by={t.addedByName}>
-              {isHost && (
-                <>
-                  <Button size="icon-sm" variant="ghost" disabled={i === 0} onClick={() => actions.moveTrack(t._id, "up")} aria-label="move up">
-                    <ArrowUp />
-                  </Button>
-                  <Button size="icon-sm" variant="ghost" disabled={i === queue.length - 1} onClick={() => actions.moveTrack(t._id, "down")} aria-label="move down">
-                    <ArrowDown />
-                  </Button>
-                </>
-              )}
-              {(isHost || t.addedBy === user.id) && (
-                <Button size="icon-sm" variant="ghost" onClick={() => actions.removeTrack(t._id)} aria-label="remove">
-                  <Trash2 />
-                </Button>
-              )}
-            </TrackRow>
-          ))}
-        </Panel>
-
-        {/* listeners */}
-        <Panel title={<><Users className="size-4" /> in the room · {listeners.length}</>}>
-          <ul className="flex flex-wrap gap-1.5">
-            {listeners.map((l) => (
-              <li key={l._id}>
-                {l.userId === user.id ? (
-                  editingName ? (
-                    <Input
-                      autoFocus
-                      defaultValue={user.name}
-                      className="h-7 w-36 text-xs"
-                      onBlur={(e) => { rename(e.target.value); setEditingName(false); }}
-                      onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-                    />
-                  ) : (
-                    <button onClick={() => setEditingName(true)} className="cursor-pointer">
-                      <Badge>{l.name} (you)</Badge>
-                    </button>
-                  )
-                ) : (
-                  <Badge variant="secondary">
-                    {l.name}
-                    {l.userId === room.hostId && " ★"}
-                  </Badge>
-                )}
-              </li>
-            ))}
-          </ul>
-        </Panel>
-
-        {/* chat */}
-        <Panel title="chat" className="flex-1 min-h-48">
-          <div className="flex-1 overflow-y-auto space-y-1 text-sm max-h-64">
-            {messages.map((m) => (
-              <p key={m._id} className="break-words">
-                <span className={cn("font-medium", m.userId === user.id && "text-muted-foreground")}>{m.name}</span>{" "}
-                <span className="text-foreground/90">{m.text}</span>
-              </p>
-            ))}
-            <div ref={chatEndRef} />
-          </div>
-          <form
-            className="flex gap-2 pt-2"
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (!chat.trim()) return;
-              actions.sendMessage(chat);
-              setChat("");
-            }}
-          >
-            <Input value={chat} onChange={(e) => setChat(e.target.value)} placeholder="say something" className="h-8 text-sm" />
-            <Button size="sm" type="submit" variant="secondary" disabled={!chat.trim()}>send</Button>
-          </form>
-        </Panel>
-      </aside>
+      </div>
     </main>
+  );
+}
+
+/** Optional source connection; room identity remains an anonymous display name. */
+function SpotifyConnection() {
+  const spotify = useSpotify();
+  if (!spotify.configured) return null;
+  return (
+    <div className="room-spotify-connection">
+      <Music2 size={17} />
+      <div><p>{spotify.connected ? spotify.profile?.name ?? "Spotify connected" : "Listening on Spotify?"}</p><span>{spotify.connected ? spotify.canPlay ? "Premium playback connected" : "Playback needs Spotify Premium" : "Connect Premium for Spotify playback"}</span></div>
+      <button type="button" className="room-text-button" onClick={spotify.connected ? spotify.disconnect : spotify.connect}>{spotify.connected ? "Disconnect" : "Connect"}</button>
+    </div>
   );
 }
 
 function NotFound() {
-  return (
-    <Centered>
-      <p>room not found</p>
-      <Button asChild variant="secondary">
-        <Link href="/">go home</Link>
-      </Button>
-    </Centered>
-  );
+  return <Centered><Headphones size={30} /><h1>This room has gone quiet.</h1><p>Check the invite link, or start a new room.</p><Link className="room-button room-button-accent" href="/"><ArrowLeft size={15} /> Back to home</Link></Centered>;
 }
 
 function Centered({ children }: { children: React.ReactNode }) {
-  return (
-    <main className="flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground">
-      {children}
-    </main>
-  );
+  return <main className="room-centered">{children}</main>;
 }
 
-function Panel({ title, children, className }: { title: React.ReactNode; children: React.ReactNode; className?: string }) {
+function TrackRow({ title, author, thumb, by, source, position, requested, hasActions, children }: { title: string; author: string; thumb: string; by: string; source?: Source; position?: number; requested?: boolean; hasActions?: boolean; children?: React.ReactNode }) {
   return (
-    <section className={cn("flex flex-col gap-2 rounded-xl border bg-card p-3", className)}>
-      <h2 className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">{title}</h2>
-      {children}
-    </section>
-  );
-}
-
-function TrackRow({ title, author, thumb, by, children }: { title: string; author: string; thumb: string; by: string; children?: React.ReactNode }) {
-  return (
-    <div className="flex items-center gap-3 rounded-lg p-1.5 hover:bg-accent/50">
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src={thumb} alt="" className="h-10 w-[71px] shrink-0 rounded object-cover bg-muted" />
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium">{title}</p>
-        <p className="truncate text-xs text-muted-foreground">{author} · {by}</p>
-      </div>
-      <div className="flex shrink-0 gap-0.5">{children}</div>
+    <div className={cn("room-track-row", requested && "room-track-request")}>
+      {position !== undefined && <span className="room-track-position">{String(position).padStart(2, "0")}</span>}
+      <div className="room-track-art">{thumb ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={thumb} alt="" loading="lazy" />
+      ) : <Music2 size={18} />}</div>
+      <div className="room-track-info"><h3>{title}</h3><p>{author}</p></div>
+      <span className="room-track-by" title={`${requested ? "Requested" : "Added"} by ${by}`}><Avatar name={by} size="sm" /><span>{by}</span></span>
+      <span className="room-track-source" title={source === "spotify" ? "Spotify" : "YouTube"}>{source === "spotify" ? <Music2 size={14} /> : <TvMinimalPlay size={15} />}</span>
+      <div className="room-track-actions">{children}</div>
+      {!requested && hasActions && (
+        <details className="room-track-options">
+          <summary aria-label={`Track options for ${title}`}><MoreHorizontal size={20} /></summary>
+          <div className="room-track-options-menu" onClick={(e) => {
+            if ((e.target as HTMLElement).closest("button:not(:disabled)")) { const details = e.currentTarget.closest("details"); details?.removeAttribute("open"); details?.querySelector("summary")?.focus(); }
+          }}>{children}</div>
+        </details>
+      )}
     </div>
   );
 }

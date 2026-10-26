@@ -14,28 +14,38 @@ export const pending = query({
       .collect(),
 });
 
+/**
+ * A decided request is never read again — only `pending` is queried — so both
+ * outcomes delete the row rather than leaving it to pile up for the room's life.
+ */
 export const approve = mutation({
-  args: { roomId: v.id("rooms"), userId: v.string(), requestId: v.id("requests") },
-  handler: async (ctx, { roomId, userId, requestId }) => {
-    await requireHost(ctx, roomId, userId);
+  args: { roomId: v.id("rooms"), hostToken: v.string(), requestId: v.id("requests") },
+  handler: async (ctx, { roomId, hostToken, requestId }) => {
+    await requireHost(ctx, roomId, hostToken);
     const r = await ctx.db.get(requestId);
     if (!r || r.roomId !== roomId || r.status !== "pending") return;
-    await ctx.db.patch(requestId, { status: "approved" });
+    await ctx.db.delete(requestId);
     await enqueue(
       ctx,
       roomId,
-      { videoId: r.videoId, title: r.title, author: r.author, thumbnail: r.thumbnail },
+      {
+        videoId: r.videoId,
+        title: r.title,
+        author: r.author,
+        thumbnail: r.thumbnail,
+        source: r.source,
+      },
       { id: r.requestedBy, name: r.requestedByName },
     );
   },
 });
 
 export const reject = mutation({
-  args: { roomId: v.id("rooms"), userId: v.string(), requestId: v.id("requests") },
-  handler: async (ctx, { roomId, userId, requestId }) => {
-    await requireHost(ctx, roomId, userId);
+  args: { roomId: v.id("rooms"), hostToken: v.string(), requestId: v.id("requests") },
+  handler: async (ctx, { roomId, hostToken, requestId }) => {
+    await requireHost(ctx, roomId, hostToken);
     const r = await ctx.db.get(requestId);
     if (!r || r.roomId !== roomId) return;
-    await ctx.db.patch(requestId, { status: "rejected" });
+    await ctx.db.delete(requestId);
   },
 });

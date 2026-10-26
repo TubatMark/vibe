@@ -11,6 +11,14 @@ const newId = () => nanoid(12);
 
 export type LocalUser = { id: string; name: string };
 
+const initialNameConfirmation = () => "false";
+
+/** A chosen name is all a guest needs; this is never an account or password. */
+export function useGuestNameConfirmed() {
+  const [value, setValue] = useLocalValue("vibe:nameConfirmed", initialNameConfirmation);
+  return [value === "true", () => setValue("true")] as const;
+}
+
 /** Anonymous guest identity persisted in localStorage. No sign-up needed. */
 export function useLocalUser(): [LocalUser | null, (name: string) => void] {
   const [id] = useLocalValue("vibe:userId", newId);

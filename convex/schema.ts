@@ -2,17 +2,36 @@ import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
 export const trackFields = {
+  /** Provider id: a YouTube video id, or a Spotify track id. */
   videoId: v.string(),
   title: v.string(),
   author: v.string(),
   thumbnail: v.string(),
+  /** Absent on rows written before Spotify support; treat those as YouTube. */
+  source: v.optional(v.union(v.literal("youtube"), v.literal("spotify"))),
+};
+
+export type Track = {
+  videoId: string;
+  title: string;
+  author: string;
+  thumbnail: string;
+  source?: "youtube" | "spotify";
 };
 
 export default defineSchema({
   rooms: defineTable({
     slug: v.string(),
     name: v.string(),
+    /** Public, pseudonymous: shown as the Host badge. Not a credential. */
     hostId: v.string(),
+    /**
+     * The host's capability for this room. Created in the host's browser,
+     * stored here, and never returned by a query — a browser can call any
+     * mutation directly, so host rights cannot ride on a published id.
+     * Absent on rooms created before host tokens: those have no host.
+     */
+    hostToken: v.optional(v.string()),
     // "open": anyone adds straight to the queue. "approval": requests need host approval.
     mode: v.union(v.literal("open"), v.literal("approval")),
     current: v.optional(v.object(trackFields)),

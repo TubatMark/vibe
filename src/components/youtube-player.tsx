@@ -23,6 +23,7 @@ type Props = {
 };
 
 const DRIFT_TOLERANCE_S = 1.0;
+const API_TIMEOUT_MS = 15_000;
 
 /** What the IFrame API's error codes mean to a listener. */
 function errorMessage(code: number) {
@@ -42,17 +43,33 @@ function errorMessage(code: number) {
 
 let apiPromise: Promise<void> | null = null;
 function loadApi() {
+  if (window.YT?.Player) return Promise.resolve();
   if (apiPromise) return apiPromise;
-  apiPromise = new Promise<void>((resolve) => {
-    if (window.YT?.Player) return resolve();
+  apiPromise = new Promise<void>((resolve, reject) => {
+    const script = document.createElement("script");
     const prev = window.onYouTubeIframeAPIReady;
-    window.onYouTubeIframeAPIReady = () => {
-      prev?.();
-      resolve();
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      script.onerror = null;
+      if (window.onYouTubeIframeAPIReady === onReady) window.onYouTubeIframeAPIReady = prev;
+      if (error) {
+        script.remove();
+        apiPromise = null;
+        reject(error);
+      } else resolve();
     };
-    const s = document.createElement("script");
-    s.src = "https://www.youtube.com/iframe_api";
-    document.head.appendChild(s);
+    const onReady = () => {
+      try { prev?.(); } finally { finish(); }
+    };
+    const timeout = setTimeout(() => finish(new Error("YouTube took too long to respond.")), API_TIMEOUT_MS);
+    window.onYouTubeIframeAPIReady = onReady;
+    script.src = "https://www.youtube.com/iframe_api";
+    script.async = true;
+    script.onerror = () => finish(new Error("Check your connection or content blocker, then try again."));
+    document.head.appendChild(script);
   });
   return apiPromise;
 }
@@ -75,8 +92,25 @@ export function YouTubePlayer({ videoId, isPlaying, syncKey, getTargetMs, volume
   isPlayingRef.current = isPlaying;
   const volumeRef = useRef(volume);
   volumeRef.current = volume;
+  const resyncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Keyed by video so a stale failure disappears as soon as the track changes.
   const [error, setError] = useState<{ videoId: string; code: number } | null>(null);
+  const [blockedVideo, setBlockedVideo] = useState<string | null>(null);
+  const [apiError, setApiError] = useState<string | null>(null);
+  const [apiAttempt, setApiAttempt] = useState(0);
+
+  const load = useCallback((id: string | null) => {
+    loadedIdRef.current = id;
+    const p = playerRef.current;
+    if (!p || !readyRef.current) return;
+    if (!id) {
+      p.stopVideo();
+      return;
+    }
+    const startS = getTargetRef.current() / 1000;
+    if (isPlayingRef.current) p.loadVideoById(id, startS);
+    else p.cueVideoById(id, startS);
+  }, []);
 
   // Create the player once.
   useEffect(() => {
@@ -96,21 +130,35 @@ export function YouTubePlayer({ videoId, isPlaying, syncKey, getTargetMs, volume
         events: {
           onReady: () => {
             readyRef.current = true;
+            setApiError(null);
             applyVolumeRef.current(volumeRef.current);
+            // The track effect can run before the IFrame API is ready. Load
+            // its saved id now so the first song does not wait for a change.
+            load(loadedIdRef.current);
             sync(true);
           },
           onError: (e) =>
             setError(loadedIdRef.current ? { videoId: loadedIdRef.current, code: e.data } : null),
+          onAutoplayBlocked: () => {
+            if (isPlayingRef.current) setBlockedVideo(loadedIdRef.current);
+          },
           onStateChange: (e) => {
             if (e.data !== YT.PlayerState.UNSTARTED) setError(null);
+            if (e.data === YT.PlayerState.PLAYING) setBlockedVideo(null);
             if (e.data === YT.PlayerState.ENDED) onEndedRef.current();
             // If a listener manually pauses via keyboard etc., snap back to room state.
             if (e.data === YT.PlayerState.PAUSED && isPlayingRef.current) {
-              setTimeout(() => sync(true), 300);
+              if (resyncTimeoutRef.current) clearTimeout(resyncTimeoutRef.current);
+              resyncTimeoutRef.current = setTimeout(() => {
+                resyncTimeoutRef.current = null;
+                sync(true);
+              }, 300);
             }
           },
         },
       });
+    }).catch((failure: unknown) => {
+      if (!cancelled) setApiError(failure instanceof Error ? failure.message : "Check your connection and try again.");
     });
     return () => {
       cancelled = true;
@@ -121,11 +169,13 @@ export function YouTubePlayer({ videoId, isPlaying, syncKey, getTargetMs, volume
       }
       playerRef.current = null;
       readyRef.current = false;
+      if (resyncTimeoutRef.current) clearTimeout(resyncTimeoutRef.current);
+      resyncTimeoutRef.current = null;
       // A player that outlives its component keeps playing audio nothing can
       // reach, so make sure the container is empty either way.
       container?.replaceChildren();
     };
-  }, []);
+  }, [load, apiAttempt]);
 
   function sync(force = false) {
     const p = playerRef.current;
@@ -143,22 +193,13 @@ export function YouTubePlayer({ videoId, isPlaying, syncKey, getTargetMs, volume
       if (state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.BUFFERING) p.playVideo();
     } else {
       if (state === YT.PlayerState.PLAYING || state === YT.PlayerState.BUFFERING) p.pauseVideo();
-      if (force || Math.abs(p.getCurrentTime() - targetS) > DRIFT_TOLERANCE_S) p.seekTo(targetS, true);
+      // Seeking CUED or UNSTARTED videos starts them. cueVideoById already
+      // supplied the paused position, so only seek an actually paused player.
+      if (state === YT.PlayerState.PAUSED && (force || Math.abs(p.getCurrentTime() - targetS) > DRIFT_TOLERANCE_S)) {
+        p.seekTo(targetS, true);
+      }
     }
   }
-
-  const load = useCallback((id: string | null) => {
-    loadedIdRef.current = id;
-    const p = playerRef.current;
-    if (!p || !readyRef.current) return;
-    if (!id) {
-      p.stopVideo();
-      return;
-    }
-    const startS = getTargetRef.current() / 1000;
-    if (isPlayingRef.current) p.loadVideoById(id, startS);
-    else p.cueVideoById(id, startS);
-  }, []);
 
   // Load a new video when the room's track changes.
   useEffect(() => {
@@ -168,6 +209,11 @@ export function YouTubePlayer({ videoId, isPlaying, syncKey, getTargetMs, volume
   function retry() {
     setError(null);
     load(videoId);
+  }
+
+  function retryApi() {
+    setApiError(null);
+    setApiAttempt((attempt) => attempt + 1);
   }
 
   // React to play/pause/seek changes immediately.
@@ -214,6 +260,15 @@ export function YouTubePlayer({ videoId, isPlaying, syncKey, getTargetMs, volume
     setNeedsUnmute(false);
   }
 
+  function startListening() {
+    if (!isPlayingRef.current || !loadedIdRef.current || !readyRef.current) return;
+    // Call the local player's methods synchronously inside the user gesture.
+    // The host's shared play/pause state stays untouched.
+    applyVolume(volumeRef.current);
+    sync(true);
+    playerRef.current?.playVideo();
+  }
+
   return (
     <div className="relative aspect-video w-full overflow-hidden rounded-xl bg-black">
       <div ref={hostRef} className="absolute inset-0 size-full" />
@@ -230,7 +285,16 @@ export function YouTubePlayer({ videoId, isPlaying, syncKey, getTargetMs, volume
         <div className="absolute inset-0" />
       )}
 
-      {needsUnmute && videoId && (
+      {isPlaying && blockedVideo === videoId && videoId ? (
+        <Button
+          size="sm"
+          variant="secondary"
+          className="absolute bottom-3 left-3 shadow-lg"
+          onClick={startListening}
+        >
+          <Volume2 /> Start listening
+        </Button>
+      ) : needsUnmute && videoId && (
         <Button
           size="sm"
           variant="secondary"
@@ -255,11 +319,24 @@ export function YouTubePlayer({ videoId, isPlaying, syncKey, getTargetMs, volume
           <div className="space-y-1">
             <p className="text-sm font-medium">{errorMessage(error.code)}</p>
             <p className="text-xs text-muted-foreground">
-              everyone else sees this too — skip it, or try again.
+              Try again, or ask the host to skip this track.
             </p>
           </div>
           <Button size="sm" variant="secondary" onClick={retry}>
             <RotateCw /> try again
+          </Button>
+        </div>
+      )}
+
+      {apiError && videoId && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-background p-6 text-center" role="alert">
+          <AlertTriangle className="size-6 text-muted-foreground" />
+          <div className="space-y-1">
+            <p className="text-sm font-medium">YouTube couldn’t load.</p>
+            <p className="text-xs text-muted-foreground">{apiError}</p>
+          </div>
+          <Button size="sm" variant="secondary" onClick={retryApi}>
+            <RotateCw /> Try again
           </Button>
         </div>
       )}
